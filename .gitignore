@@ -1,0 +1,10 @@
+*.log
+*.zip
+*.7z
+*.rar
+*.tmp
+*.bak
+__MISTAKE_*
+__DEPRECATED_*
+docs/
+tools/
