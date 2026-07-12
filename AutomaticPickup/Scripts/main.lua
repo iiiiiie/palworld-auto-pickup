@@ -127,11 +127,9 @@ local function get_async_bind_window_seconds()
 end
 
 local function get_async_bind_radius()
-    local value = tonumber(config.ASYNC_BIND_RADIUS)
-    if value == nil or value <= 0 then
-        return 900.0
-    end
-    return value
+    -- __DEPRECATED_20260713__ Location fallback is disabled. The retained config
+    -- value is not read by strict source binding.
+    return nil
 end
 
 local function get_pal_utility()
@@ -168,14 +166,10 @@ local function is_model_server_context(model)
         return true
     end
 
-    if is_valid(model) and model.GetActor ~= nil then
-        local ok, actor = pcall(function()
-            return model:GetActor()
-        end)
-        if ok and is_server_context(actor) then
-            return true
-        end
-    end
+    -- __DEPRECATED_20260713__ Do not fall back through model:GetActor() here.
+    -- Drop models can be constructed/enabled while their backing actor is not in
+    -- a safe state for UE4SS-side UFunction calls. Bound records already carry a
+    -- server-validated death context, so caller code should prefer that context.
 
     return false
 end
@@ -516,6 +510,27 @@ local function resolve_player_id_from_player_uid(playerUid, worldContext)
     return get_player_id(playerState)
 end
 
+local function resolve_player_id_from_player_uid_candidates(playerUid, ...)
+    local seen = {}
+
+    for index = 1, select("#", ...) do
+        local worldContext = select(index, ...)
+        if is_valid(worldContext) then
+            local key = tostring(worldContext)
+            if not seen[key] then
+                seen[key] = true
+
+                local playerId = resolve_player_id_from_player_uid(playerUid, worldContext)
+                if playerId ~= nil then
+                    return playerId
+                end
+            end
+        end
+    end
+
+    return nil
+end
+
 local function try_get_player_state_from_candidate(utility, candidate)
     if not is_valid(candidate) then
         return nil
@@ -605,6 +620,8 @@ local function resolve_player_state_from_attacker(attacker)
 end
 
 local function vector_distance_squared(a, b)
+    -- __DEPRECATED_20260713__ Retained only for diagnosing the old location
+    -- fallback path. Strict source binding no longer calls this function.
     local dx = (a.X or 0.0) - (b.X or 0.0)
     local dy = (a.Y or 0.0) - (b.Y or 0.0)
     local dz = (a.Z or 0.0) - (b.Z or 0.0)
@@ -635,16 +652,9 @@ local function get_model_location(model)
         return nil
     end
 
-    local okActor, actor = pcall(function()
-        return model:GetActor()
-    end)
-    if okActor and is_valid(actor) then
-        local actorLocation = get_actor_location(actor)
-        if actorLocation ~= nil then
-            return actorLocation
-        end
-    end
-
+    -- __DEPRECATED_20260713__ Location fallback is disabled. Do not call
+    -- model:GetActor() here; Palworld can fatal if the map object model is not
+    -- fully registered or has already been destroyed.
     -- __DEPRECATED_20260713__ Do not call model:GetTransform() here. Palworld
     -- can fatal if the map object model is not registered yet or has already
     -- been destroyed, especially while loading a save.
@@ -657,13 +667,9 @@ local function get_instance_key(model)
         return nil
     end
 
-    local ok, guid = pcall(function()
-        return model:GetInstanceId()
-    end)
-    if ok and guid ~= nil then
-        return tostring(guid)
-    end
-
+    -- __DEPRECATED_20260713__ Do not call model:GetInstanceId() for routine
+    -- binding. It is a Pal map-object UFunction, not needed for object identity,
+    -- and may run while the model lifecycle is unstable.
     local okName, fullName = pcall(function()
         return model:GetFullName()
     end)
@@ -695,22 +701,10 @@ local function add_model_keys(keys, seen, model)
 
     add_key(tostring(model))
 
-    local okInstanceId, instanceId = pcall(function()
-        return model:GetInstanceId()
-    end)
-    if okInstanceId then
-        add_key(instanceId)
-    end
-
-    local okModelInstanceId, modelInstanceId = pcall(function()
-        if model.GetModelInstanceId ~= nil then
-            return model:GetModelInstanceId()
-        end
-        return nil
-    end)
-    if okModelInstanceId then
-        add_key(modelInstanceId)
-    end
+    -- __DEPRECATED_20260713__ Instance-id UFunctions are intentionally not used
+    -- for matching. Object identity plus UObject full name are sufficient for
+    -- this UE4SS process, and avoiding map-object lifecycle calls reduces crash
+    -- risk around newly spawned or already-picked drops.
 
     local okFullName, fullName = pcall(function()
         return model:GetFullName()
@@ -761,28 +755,41 @@ end
 local cleanup_pending_death_contexts
 
 local function find_pending_context_by_player_uid(playerUid, worldContext)
-    if playerUid == nil then
-        return nil, nil
-    end
-
-    local playerId = resolve_player_id_from_player_uid(playerUid, worldContext)
-    if playerId == nil then
+    if playerUid == nil or guid_looks_empty(playerUid) then
         return nil, nil
     end
 
     cleanup_pending_death_contexts()
 
+    local resolvedPlayerId = nil
+    local utility = get_pal_utility()
+
     for _, context in ipairs(pendingDeathContexts) do
         if context ~= nil
             and context.active
             and context.playerId ~= nil
-            and context.playerId == playerId
         then
-            return context, playerId
+            if guid_equals(playerUid, context.playerUid) then
+                return context, context.playerId
+            end
+
+            local playerId = resolve_player_id_from_player_uid_candidates(
+                playerUid,
+                worldContext,
+                context.enemyActor,
+                context.playerState,
+                utility
+            )
+            if playerId ~= nil then
+                resolvedPlayerId = playerId
+                if playerId == context.playerId then
+                    return context, playerId
+                end
+            end
         end
     end
 
-    return nil, playerId
+    return nil, resolvedPlayerId
 end
 
 cleanup_pending_death_contexts = function()
@@ -849,6 +856,11 @@ local function bind_drop_model_to_context(model, context)
 
     cleanup_bound_records()
 
+    local existingRecord = boundDropModelsByObject[model]
+    if existingRecord ~= nil and not existingRecord.completed then
+        return existingRecord
+    end
+
     local record = {
         boundAt = get_now(),
         contextId = context.contextId,
@@ -876,6 +888,8 @@ local function bind_drop_model_to_context(model, context)
         tostring(context.playerId),
         get_object_name(model)
     ))
+
+    return record
 end
 
 local function queue_pending_death_context(context)
@@ -900,10 +914,9 @@ local function queue_pending_death_context(context)
     cleanup_pending_death_contexts()
 
     source_debug_log(string.format(
-        "queued async death context %s for %.2fs radius %.1f",
+        "queued async death context %s for %.2fs using pickupable player uid binding",
         tostring(context.contextId),
-        get_async_bind_window_seconds(),
-        get_async_bind_radius()
+        get_async_bind_window_seconds()
     ))
 end
 
@@ -914,7 +927,7 @@ local function find_pending_death_context_for_model(model)
     if pickupablePlayerUid ~= nil then
         -- __DEPRECATED_20260713__ Direct FGuid userdata comparison via tostring
         -- returns wrapper addresses in UE4SS. Resolve to PlayerState/playerId first.
-        local uidContext, resolvedPlayerId = find_pending_context_by_player_uid(pickupablePlayerUid, model)
+        local uidContext, resolvedPlayerId = find_pending_context_by_player_uid(pickupablePlayerUid, nil)
         if uidContext ~= nil then
             source_debug_log(string.format(
                 "matched async drop by pickupable player uid/player id %s to context %s",
@@ -930,7 +943,7 @@ local function find_pending_death_context_for_model(model)
                 tostring(resolvedPlayerId)
             )
         else
-            source_debug_log("pickupable player uid did not resolve to a player; trying location fallback")
+            return nil, "pickupable player uid did not resolve; location fallback disabled"
         end
     end
 
@@ -938,38 +951,12 @@ local function find_pending_death_context_for_model(model)
         return nil, "no pending Pal death context active"
     end
 
-    local dropLocation = get_model_location(model)
-    if dropLocation == nil then
-        return nil, "drop location unavailable"
-    end
-
-    local radius = get_async_bind_radius()
-    local radiusSquared = radius * radius
-    local bestContext = nil
-    local bestDistanceSquared = nil
-
-    for _, context in ipairs(pendingDeathContexts) do
-        if context ~= nil and context.active and context.enemyLocation ~= nil then
-            local distanceSquared = vector_distance_squared(dropLocation, context.enemyLocation)
-            if distanceSquared <= radiusSquared
-                and (bestDistanceSquared == nil or distanceSquared < bestDistanceSquared)
-            then
-                bestContext = context
-                bestDistanceSquared = distanceSquared
-            end
-        end
-    end
-
-    if bestContext == nil then
-        return nil, "no pending Pal death context matched"
-    end
-
-    source_debug_log(string.format(
-        "matched async drop to context %s distance %.1f",
-        tostring(bestContext.contextId),
-        math.sqrt(bestDistanceSquared or 0.0)
-    ))
-    return bestContext, nil
+    -- __DEPRECATED_20260713__ The old async location fallback matched a drop
+    -- to the closest validated Pal death context by spawn distance. Live testing
+    -- showed this can overlap with mining/logging drops and can request pickup
+    -- for an unrelated model. Strict source binding now fails closed unless the
+    -- drop exposes a PickupablePlayerUid that resolves to the killer player.
+    return nil, "drop has no resolvable pickupable player uid; location fallback disabled"
 end
 
 local function bind_drop_model_to_pending_context(model)
@@ -978,8 +965,7 @@ local function bind_drop_model_to_pending_context(model)
         return nil, reason
     end
 
-    bind_drop_model_to_context(model, context)
-    return get_bound_record(model), nil
+    return bind_drop_model_to_context(model, context), nil
 end
 
 function get_bound_record(model)
@@ -1226,10 +1212,6 @@ end
 
 local function try_auto_pickup_bound_drop(model)
     if not config.ENABLED or not is_valid(model) then
-        return
-    end
-    if not is_model_server_context(model) then
-        source_debug_log("ignored drop: not server context")
         return
     end
 

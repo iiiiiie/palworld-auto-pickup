@@ -50,9 +50,11 @@ Edit `AutomaticPickup/Scripts/config.lua`.
   Leave this enabled for normal use.
 - `DEBUG_SOURCE_BINDING`: Logs death context, binding, and ignore reasons.
 - `ASYNC_BIND_WINDOW_SECONDS`: Short window for Pal death drops created after
-  the native death hook returns.
-- `ASYNC_BIND_RADIUS`: Location fallback radius used only inside an already
-  validated Pal death context.
+  the native death hook returns. Drops in this window must still expose a
+  `PickupablePlayerUid` that resolves to the killer player.
+- `ASYNC_BIND_RADIUS`: Deprecated diagnostic value. Strict source binding no
+  longer reads it because location fallback can overlap with mining, logging,
+  harvesting, or other world drops.
 - `PICKUP_DELAY_MS`: Delay before requesting native pickup after the drop
   becomes interactable.
 
@@ -75,5 +77,5 @@ rates, quantities, world settings, inventory limits, and pickup permissions stay
 native to the game.
 
 If Palworld changes the death-drop or map-object lifecycle, this mod may need a
-small hook update. The strict fallback behavior is intentionally conservative to
+small hook update. The strict binding behavior is intentionally conservative to
 avoid collecting unrelated world drops.
